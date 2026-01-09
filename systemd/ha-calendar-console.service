@@ -1,0 +1,42 @@
+# systemd service for Home Assistant Calendar Console
+# Auto-starts the calendar display on a kiosk terminal
+#
+# Installation:
+#   1. Copy to: /etc/systemd/system/ha-calendar-console.service
+#   2. Edit User, WorkingDirectory, and Environment paths
+#   3. Enable: sudo systemctl enable ha-calendar-console
+#   4. Start:  sudo systemctl start ha-calendar-console
+#
+# For TTY kiosk mode, also configure:
+#   - Auto-login on tty1 via /etc/systemd/system/getty@tty1.service.d/override.conf
+#   - Or use .bash_profile to launch on login
+
+[Unit]
+Description=Home Assistant Calendar Console Display
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kiosk
+WorkingDirectory=/home/kiosk/homeAssistantHelper
+Environment="HOMEASSISTANT_URL=http://192.168.1.40:8123"
+Environment="HOMEASSISTANT_LONG_LIVE_TOKEN=your_token_here"
+Environment="HA_CALENDAR_ENTITY=calendar.family_calendar"
+Environment="TERM=linux"
+
+# For TTY display
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+
+ExecStart=/usr/bin/python3 /home/kiosk/homeAssistantHelper/ha_calendar_console.py
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
