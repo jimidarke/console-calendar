@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#1a1a2e">
+  <title>Family Calendar</title>
+  <link rel="manifest" href="/static/manifest.json">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1a1a2e;
+      color: #eee;
+      min-height: 100vh;
+      padding: 1rem;
+    }
+    .container { max-width: 500px; margin: 0 auto; }
+    h1 {
+      text-align: center;
+      font-size: 1.4rem;
+      margin-bottom: 1.5rem;
+      color: #e94560;
+    }
+    .input-group {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 0.75rem;
+    }
+    #eventText {
+      flex: 1;
+      padding: 1rem;
+      font-size: 1.1rem;
+      border: 2px solid #333;
+      border-radius: 12px;
+      background: #16213e;
+      color: #eee;
+      outline: none;
+    }
+    #eventText:focus { border-color: #e94560; }
+    #eventText::placeholder { color: #666; }
+    .btn {
+      padding: 1rem 1.25rem;
+      font-size: 1.1rem;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      font-weight: 600;
+      transition: opacity 0.2s;
+    }
+    .btn:active { opacity: 0.7; }
+    .btn-primary { background: #e94560; color: white; }
+    .btn-camera {
+      background: #16213e;
+      border: 2px solid #333;
+      color: #eee;
+      font-size: 1.3rem;
+      padding: 1rem;
+    }
+    .btn-submit {
+      width: 100%;
+      padding: 1rem;
+      background: #e94560;
+      color: white;
+      font-size: 1.1rem;
+      border-radius: 12px;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+      margin-bottom: 1rem;
+    }
+    .btn-submit:disabled { opacity: 0.5; cursor: not-allowed; }
+    #cameraInput { display: none; }
+    #result {
+      margin-top: 1rem;
+      padding: 1rem;
+      border-radius: 12px;
+      display: none;
+      font-size: 0.95rem;
+      line-height: 1.5;
+    }
+    .result-created { background: #0a3d2a; border: 1px solid #1a6b3f; }
+    .result-confirm { background: #3d3a0a; border: 1px solid #6b6a1a; }
+    .result-error { background: #3d0a0a; border: 1px solid #6b1a1a; }
+    .result-scanning { background: #16213e; border: 1px solid #333; }
+    .preview-container {
+      margin-bottom: 0.75rem;
+      display: none;
+      position: relative;
+    }
+    .preview-container img {
+      width: 100%;
+      max-height: 200px;
+      object-fit: cover;
+      border-radius: 12px;
+      border: 2px solid #333;
+    }
+    .preview-close {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: rgba(0,0,0,0.7);
+      color: white;
+      border: none;
+      border-radius: 50%;
+      width: 28px;
+      height: 28px;
+      cursor: pointer;
+      font-size: 1rem;
+    }
+    .hint {
+      text-align: center;
+      color: #555;
+      font-size: 0.8rem;
+      margin-top: 1.5rem;
+    }
+    .spinner {
+      display: inline-block;
+      width: 16px;
+      height: 16px;
+      border: 2px solid #eee;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .scan-events { margin-top: 0.75rem; }
+    .scan-event {
+      background: #16213e;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 0.75rem;
+      margin-bottom: 0.5rem;
+    }
+    .scan-event .title { font-weight: 600; color: #e94560; }
+    .scan-event .details { color: #aaa; font-size: 0.85rem; margin-top: 0.25rem; }
+    .event-card { margin-top: 0.5rem; }
+    .event-card .field { display: flex; justify-content: space-between; padding: 0.3rem 0; border-bottom: 1px solid rgba(255,255,255,0.08); }
+    .event-card .field:last-child { border-bottom: none; }
+    .event-card .label { color: #888; font-size: 0.85rem; }
+    .event-card .value { color: #eee; font-weight: 500; text-align: right; font-size: 0.95rem; }
+    .event-card .event-title { font-size: 1.1rem; color: #e94560; font-weight: 700; margin-bottom: 0.4rem; }
+    .event-card .link { margin-top: 0.5rem; }
+    .event-card .link a { color: #5bc0de; text-decoration: none; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Family Calendar</h1>
+
+    <div class="input-group">
+      <input type="text" id="eventText" placeholder="jonnie pta thursday 445pm"
+             autocomplete="off" autofocus enterkeyhint="send">
+      <button class="btn btn-camera" onclick="document.getElementById('cameraInput').click()" title="Scan photo">
+        &#128247;
+      </button>
+    </div>
+    <input type="file" id="cameraInput" accept="image/*" capture="environment">
+
+    <div class="preview-container" id="previewContainer">
+      <img id="previewImage">
+      <button class="preview-close" onclick="clearPhoto()">&#10005;</button>
+    </div>
+
+    <button class="btn-submit" id="submitBtn" onclick="submit()">Add to Calendar</button>
+
+    <div id="result"></div>
+
+    <p class="hint">Type an event or snap a photo of a flyer, permission slip, or note.</p>
+  </div>
+
+  <script>
+    const textInput = document.getElementById('eventText');
+    const cameraInput = document.getElementById('cameraInput');
+    const previewContainer = document.getElementById('previewContainer');
+    const previewImage = document.getElementById('previewImage');
+    const submitBtn = document.getElementById('submitBtn');
+    const result = document.getElementById('result');
+
+    let selectedFile = null;
+
+    // Enter key submits
+    textInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submit();
+    });
+
+    // Photo selected
+    cameraInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      selectedFile = file;
+      previewImage.src = URL.createObjectURL(file);
+      previewContainer.style.display = 'block';
+      textInput.placeholder = 'Add a note (optional)...';
+    });
+
+    function clearPhoto() {
+      selectedFile = null;
+      cameraInput.value = '';
+      previewContainer.style.display = 'none';
+      previewImage.src = '';
+      textInput.placeholder = 'jonnie pta thursday 445pm';
+    }
+
+    async function submit() {
+      const text = textInput.value.trim();
+
+      if (!text && !selectedFile) {
+        textInput.focus();
+        return;
+      }
+
+      submitBtn.disabled = true;
+      showResult('scanning', '<span class="spinner"></span> Working on it...');
+
+      try {
+        let data;
+
+        if (selectedFile) {
+          // Photo scan
+          const formData = new FormData();
+          formData.append('file', selectedFile);
+          const resp = await fetch('/scan', { method: 'POST', body: formData });
+          data = await resp.json();
+          if (!resp.ok) throw new Error(data.detail || 'Scan failed');
+          showScanResult(data);
+
+          // If there was also text, submit that too
+          if (text) {
+            const textResp = await fetch('/add', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text, source: 'web' }),
+            });
+            const textData = await textResp.json();
+            if (textResp.ok) appendResult(textData);
+          }
+        } else {
+          // Text only
+          const resp = await fetch('/add', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text, source: 'web' }),
+          });
+          data = await resp.json();
+          if (!resp.ok) throw new Error(data.detail || 'Request failed');
+          showTextResult(data);
+        }
+
+        textInput.value = '';
+        clearPhoto();
+      } catch (err) {
+        showResult('error', err.message);
+      } finally {
+        submitBtn.disabled = false;
+      }
+    }
+
+    function formatDate(dateStr) {
+      const d = new Date(dateStr + 'T00:00:00');
+      return d.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' });
+    }
+
+    function formatTime(timeStr) {
+      if (!timeStr) return null;
+      const [h, m] = timeStr.split(':').map(Number);
+      const ampm = h >= 12 ? 'PM' : 'AM';
+      const h12 = h % 12 || 12;
+      return h12 + ':' + String(m).padStart(2, '0') + ' ' + ampm;
+    }
+
+    function buildEventCard(parsed, event) {
+      let html = '<div class="event-card">';
+      html += '<div class="event-title">' + escapeHtml(parsed.title) + '</div>';
+
+      html += '<div class="field"><span class="label">Date</span><span class="value">' + escapeHtml(formatDate(parsed.date)) + '</span></div>';
+
+      if (parsed.start_time) {
+        html += '<div class="field"><span class="label">Time</span><span class="value">' + escapeHtml(formatTime(parsed.start_time)) + '</span></div>';
+      } else {
+        html += '<div class="field"><span class="label">Time</span><span class="value">All day</span></div>';
+      }
+
+      if (parsed.duration_minutes && parsed.start_time) {
+        html += '<div class="field"><span class="label">Duration</span><span class="value">' + parsed.duration_minutes + ' min</span></div>';
+      }
+
+      if (parsed.person) {
+        html += '<div class="field"><span class="label">Person</span><span class="value">' + escapeHtml(parsed.person) + '</span></div>';
+      }
+
+      if (event && event.link) {
+        html += '<div class="link"><a href="' + escapeHtml(event.link) + '" target="_blank">Open in Google Calendar &rarr;</a></div>';
+      }
+
+      html += '</div>';
+      return html;
+    }
+
+    function showTextResult(data) {
+      if (data.status === 'created' && data.parsed) {
+        showResult('created', '<strong>Event created</strong>' + buildEventCard(data.parsed, data.event));
+      } else if (data.status === 'needs_confirmation' && data.parsed) {
+        showResult('confirm', '<strong>Needs confirmation</strong>' + buildEventCard(data.parsed, null));
+      } else if (data.status === 'unparseable') {
+        showResult('error', data.message);
+      } else {
+        showResult('error', data.message || 'Unknown response');
+      }
+    }
+
+    function showScanResult(data) {
+      if (data.status === 'no_events') {
+        showResult('confirm', data.message);
+        return;
+      }
+      let html = '<strong>' + escapeHtml(data.message) + '</strong><div class="scan-events">';
+      for (const ev of (data.created || [])) {
+        html += '<div class="scan-event">' + buildEventCard(ev, ev.calendar_event || null) + '</div>';
+      }
+      for (const ev of (data.needs_confirmation || [])) {
+        html += '<div class="scan-event" style="border-color:#6b6a1a"><span class="title">'
+          + escapeHtml(ev.title) + ' (needs confirmation)</span>'
+          + buildEventCard(ev, null) + '</div>';
+      }
+      html += '</div>';
+      showResult(data.created?.length ? 'created' : 'confirm', html);
+    }
+
+    function appendResult(data) {
+      const extra = document.createElement('div');
+      extra.style.marginTop = '0.75rem';
+      extra.style.paddingTop = '0.75rem';
+      extra.style.borderTop = '1px solid #333';
+      extra.innerHTML = escapeHtml(data.message);
+      result.appendChild(extra);
+    }
+
+    function showResult(type, html) {
+      result.className = 'result-' + type;
+      result.innerHTML = html;
+      result.style.display = 'block';
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // Register service worker for PWA
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+    }
+  </script>
+</body>
+</html>

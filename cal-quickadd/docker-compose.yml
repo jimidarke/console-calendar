@@ -1,0 +1,11 @@
+services:
+  cal-quickadd:
+    build: .
+    container_name: cal-quickadd
+    ports:
+      - "8419:8419"
+    volumes:
+      - ./config:/config
+    env_file:
+      - .env
+    restart: unless-stopped
