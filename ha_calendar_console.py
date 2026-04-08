@@ -10,11 +10,15 @@ Environment Variables:
     See .env.example for full list of configuration options.
 
 Controls:
-    q, ESC      - Quit
-    UP/DOWN, j/k - Scroll
-    PgUp/PgDn   - Scroll page
-    Home/End    - Jump to top/bottom
-    r           - Force refresh
+    q, ESC        - Quit
+    a             - Agenda view (list)
+    m             - Month view (grid)
+    w             - Week view (columns)
+    UP/DOWN, j/k  - Scroll
+    LEFT/RIGHT    - Navigate months/weeks (in month/week views)
+    PgUp/PgDn     - Scroll page
+    Home/End      - Jump to top/bottom, reset to current period
+    r             - Force refresh
 
 Repository: https://github.com/jimidarke/console-calendar
 """
@@ -66,7 +70,7 @@ HA_TOKEN = os.environ.get("HOMEASSISTANT_LONG_LIVE_TOKEN", "")
 # Calendar Settings
 CALENDAR_ENTITY = os.environ.get("HA_CALENDAR_ENTITY", "calendar.family")
 CALENDAR_TITLE = os.environ.get("HA_CALENDAR_TITLE", "FAMILY CALENDAR")
-DAYS_AHEAD = int(os.environ.get("HA_DAYS_AHEAD", "7"))
+DAYS_AHEAD = int(os.environ.get("HA_DAYS_AHEAD", "60"))
 
 # Display Options
 USE_UNICODE = os.environ.get("HA_USE_UNICODE", "true").lower() == "true"
@@ -78,6 +82,12 @@ TIMEZONE_NAME = os.environ.get("HA_TIMEZONE", "")
 # Refresh Intervals
 API_REFRESH_INTERVAL = int(os.environ.get("HA_API_REFRESH_INTERVAL", "60"))
 SCREEN_REFRESH_INTERVAL = int(os.environ.get("HA_SCREEN_REFRESH_INTERVAL", "1"))
+
+# View Settings
+DEFAULT_VIEW = os.environ.get("HA_DEFAULT_VIEW", "agenda")  # agenda, month, week
+WEEK_START = os.environ.get("HA_WEEK_START", "monday").lower()  # monday or sunday
+WEEK_HOUR_START = int(os.environ.get("HA_WEEK_HOUR_START", "7"))
+WEEK_HOUR_END = int(os.environ.get("HA_WEEK_HOUR_END", "21"))
 
 
 def get_local_tz():
@@ -131,6 +141,10 @@ SYMBOLS = {
     'diamond': '◆',
     'check': '✓',
     'allday': '▓',
+    'timed': '●',
+    'allday_icon': '○',
+    'today': '◉',
+    'continuation': '│',
 }
 
 # Fallback ASCII symbols for terminals without Unicode
@@ -145,6 +159,10 @@ SYMBOLS_ASCII = {
     'diamond': '<>',
     'check': '+',
     'allday': '#',
+    'timed': '*',
+    'allday_icon': 'o',
+    'today': '@',
+    'continuation': '|',
 }
 
 
@@ -326,6 +344,11 @@ class CalendarUI:
         self.show_descriptions = SHOW_DESCRIPTIONS
         self.running = True
 
+        # View state
+        self.current_view = DEFAULT_VIEW  # 'agenda', 'month', 'week'
+        self.view_offset = 0  # Offset for month/week navigation (0 = current)
+        self.cached_events = []  # Store events for all views
+
         self._init_colors()
         self._init_screen()
 
@@ -366,46 +389,56 @@ class CalendarUI:
         return SYMBOLS_ASCII.get(name, '?')
 
     def build_content(self, events: list) -> list[tuple[str, int]]:
-        """Build content lines with color attributes."""
+        """Build content lines based on current view."""
+        if self.current_view == 'month':
+            return self.build_month_content(events)
+        elif self.current_view == 'week':
+            return self.build_week_content(events)
+        else:
+            return self.build_agenda_content(events)
+
+    def build_agenda_content(self, events: list) -> list[tuple[str, int]]:
+        """Build agenda view content lines with color attributes."""
         lines = []
         today = today_local()
         grouped = group_events_by_date(events)
 
-        # Funky separator patterns
-        separators = [
-            "·═══════════════════════════════════════════════════════════·",
-            "·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·~·",
-            "·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·•·",
-            "·◆·◇·◆·◇·◆·◇·◆·◇·◆·◇·◆·◇·◆·◇·◆·◇·◆·◇·◆·◇·◆·◇·◆·◇·◆·◇·◆·◇·◆·◇·",
-            "·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·─·",
-            "·▪·▫·▪·▫·▪·▫·▪·▫·▪·▫·▪·▫·▪·▫·▪·▫·▪·▫·▪·▫·▪·▫·▪·▫·▪·▫·▪·▫·▪·▫·",
-            "·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·░·",
-        ]
+        # Get terminal width for dynamic sizing
+        _, term_width = self.stdscr.getmaxyx()
+        separator_width = term_width - 6
 
         # Generate dates for next DAYS_AHEAD days
         for day_offset in range(DAYS_AHEAD):
             current_date = today + timedelta(days=day_offset)
             date_key = current_date.strftime("%Y-%m-%d")
 
-            # Day label
+            # Day label - simplified
             if day_offset == 0:
                 day_label = "TODAY"
+                date_suffix = current_date.strftime(" - %B %d").upper()
             elif day_offset == 1:
                 day_label = "TOMORROW"
+                date_suffix = current_date.strftime(" - %B %d").upper()
             else:
                 day_label = current_date.strftime("%A").upper()
+                date_suffix = current_date.strftime(" - %B %d").upper()
 
-            date_str = current_date.strftime("%B %d, %Y").upper()
-
-            # Pick a separator pattern (cycle through them)
-            sep = separators[day_offset % len(separators)]
-
-            # Separator line
+            # Special highlight border for today
             lines.append(("", 0))
-            lines.append((sep, curses.color_pair(self.COLOR_DIM) | curses.A_DIM))
-            lines.append((f" {self.get_symbol('star')} {day_label} {current_date.strftime('%A').upper()} - {date_str}",
-                         curses.color_pair(self.COLOR_DATE) | curses.A_BOLD))
-            lines.append((sep, curses.color_pair(self.COLOR_DIM) | curses.A_DIM))
+            if day_offset == 0:
+                # Today gets a bold double-line border
+                top_border = f"  ╔{'═' * separator_width}╗"
+                lines.append((top_border, curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD))
+                lines.append((f"  ║ {self.get_symbol('star')} {day_label}{date_suffix}{' ' * (separator_width - len(day_label) - len(date_suffix) - 3)}║",
+                             curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD))
+                bot_border = f"  ╚{'═' * separator_width}╝"
+                lines.append((bot_border, curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD))
+            else:
+                # Other days get a simple line
+                sep_line = f"  ─{'─' * separator_width}─"
+                lines.append((sep_line, curses.color_pair(self.COLOR_DIM)))
+                lines.append((f"    {day_label}{date_suffix}",
+                             curses.color_pair(self.COLOR_DATE) | curses.A_BOLD))
 
             # Events for this day
             day_events = grouped.get(date_key, [])
@@ -440,12 +473,346 @@ class CalendarUI:
 
         return lines
 
-    def render_header(self, height: int, width: int):
-        """Render the header section."""
-        now = now_local()
+    def build_month_content(self, events: list) -> list[tuple[str, int]]:
+        """Build month grid view content."""
+        import calendar
+        lines = []
+        today = today_local()
+        grouped = group_events_by_date(events)
+
+        # Get terminal dimensions for dynamic sizing
+        term_height, term_width = self.stdscr.getmaxyx()
+
+        # Calculate the displayed month based on view_offset
+        year = today.year
+        month = today.month + self.view_offset
+        while month > 12:
+            month -= 12
+            year += 1
+        while month < 1:
+            month += 12
+            year -= 1
+
+        # Get first day of month and number of days
+        first_weekday, num_days = calendar.monthrange(year, month)
+        month_name = calendar.month_name[month].upper()
+
+        # Calculate number of weeks needed
+        total_days = first_weekday + num_days
+        num_weeks = (total_days + 6) // 7
+
+        # Dynamic sizing
+        available_width = term_width - 4
+        day_width = max(8, available_width // 7)
+
+        # Calculate rows per week based on available height
+        # Reserve: header+controls(5) + month header(3) + week headers(1) + top border(1) + separators(num_weeks-1) + bottom border(1) + legend(2)
+        fixed_rows = 5 + 3 + 1 + 1 + (num_weeks - 1) + 1 + 2
+        available_height = term_height - fixed_rows
+        rows_per_week = max(2, available_height // num_weeks)  # Minimum 2 rows per week
+
+        # Header
+        lines.append(("", 0))
+        lines.append((f"  {month_name} {year}", curses.color_pair(self.COLOR_DATE) | curses.A_BOLD))
+        lines.append(("", 0))
+
+        # Week day headers
+        headers = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        header_line = "  " + "".join(f"{h:^{day_width}}" for h in headers)
+        lines.append((header_line, curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD))
 
         # Top border
-        header_width = min(width - 2, 70)
+        border_line = "  ┌" + "┬".join(["─" * (day_width - 1)] * 7) + "┐"
+        lines.append((border_line, curses.color_pair(self.COLOR_DIM)))
+
+        # Generate weeks
+        day = 1
+        for week in range(6):
+            if day > num_days:
+                break
+
+            # Build cell data for this week
+            week_cells = []
+            for weekday in range(7):
+                if week == 0 and weekday < first_weekday:
+                    week_cells.append(None)
+                elif day > num_days:
+                    week_cells.append(None)
+                else:
+                    current_date = datetime(year, month, day).date()
+                    date_key = current_date.strftime("%Y-%m-%d")
+                    day_events = grouped.get(date_key, [])
+                    is_today = current_date == today
+                    week_cells.append({
+                        'day': day,
+                        'is_today': is_today,
+                        'events': day_events
+                    })
+                    day += 1
+
+            # Render multiple rows per week
+            for row_idx in range(rows_per_week):
+                # Build row with individual cell rendering for today highlight
+                row_parts = []
+                row_parts.append(("  │", curses.color_pair(self.COLOR_DIM)))
+
+                for cell in week_cells:
+                    if cell is None:
+                        row_parts.append((" " * (day_width - 1) + "│", curses.color_pair(self.COLOR_DIM)))
+                    else:
+                        cell_content = ""
+                        if row_idx == 0:
+                            # First row: day number
+                            if cell['is_today']:
+                                cell_content = f"★ {cell['day']:2d} ★"
+                            else:
+                                cell_content = f" {cell['day']:2d} "
+                        else:
+                            # Subsequent rows: show events
+                            event_idx = row_idx - 1
+                            if event_idx < len(cell['events']):
+                                event = cell['events'][event_idx]
+                                max_len = day_width - 3
+                                if event['is_all_day']:
+                                    title = event['summary'][:max_len - 2]
+                                    cell_content = f"{self.get_symbol('allday_icon')} {title}"
+                                else:
+                                    # Show time + title for timed events
+                                    if TIME_FORMAT == "12":
+                                        time_str = event['start'].strftime("%I:%M%p").lstrip('0').replace('AM','a').replace('PM','p')
+                                    else:
+                                        time_str = event['start'].strftime("%H:%M")
+                                    remaining = max_len - len(time_str) - 1
+                                    title = event['summary'][:max(0, remaining)]
+                                    cell_content = f"{time_str} {title}"
+                            elif event_idx == len(cell['events']) and len(cell['events']) > 0:
+                                # Empty row after events
+                                cell_content = ""
+
+                        formatted_cell = f"{cell_content:^{day_width - 1}}"[:day_width - 1] + "│"
+
+                        # Today gets special highlight
+                        if cell['is_today']:
+                            row_parts.append((formatted_cell, curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD))
+                        elif row_idx == 0:
+                            row_parts.append((formatted_cell, curses.color_pair(self.COLOR_EVENT)))
+                        else:
+                            row_parts.append((formatted_cell, curses.color_pair(self.COLOR_TIME)))
+
+                # Combine parts into single line for simple rendering
+                # For today highlighting, we need to render cell by cell
+                full_line = "".join(part[0] for part in row_parts)
+
+                # Check if any cell is today to use highlight
+                has_today = any(cell and cell['is_today'] for cell in week_cells)
+                if has_today and row_idx == 0:
+                    lines.append((full_line, curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD))
+                elif row_idx == 0:
+                    lines.append((full_line, curses.color_pair(self.COLOR_EVENT)))
+                else:
+                    lines.append((full_line, curses.color_pair(self.COLOR_TIME)))
+
+            # Row separator (except after last week)
+            if day <= num_days:
+                sep_line = "  ├" + "┼".join(["─" * (day_width - 1)] * 7) + "┤"
+                lines.append((sep_line, curses.color_pair(self.COLOR_DIM)))
+
+        # Bottom border
+        bottom_line = "  └" + "┴".join(["─" * (day_width - 1)] * 7) + "┘"
+        lines.append((bottom_line, curses.color_pair(self.COLOR_DIM)))
+
+        # Legend
+        lines.append(("", 0))
+        lines.append((f"  {self.get_symbol('timed')} = timed event  {self.get_symbol('allday_icon')} = all-day event  [ ] = today",
+                     curses.color_pair(self.COLOR_DIM)))
+
+        return lines
+
+    def build_week_content(self, events: list) -> list[tuple[str, int]]:
+        """Build week column view with hourly time slots."""
+        lines = []
+        today = today_local()
+        grouped = group_events_by_date(events)
+
+        # Get terminal dimensions for dynamic sizing
+        term_height, term_width = self.stdscr.getmaxyx()
+
+        # Calculate the week to display based on view_offset
+        # Find Monday of current week
+        days_since_monday = today.weekday()  # Monday = 0
+        week_start = today - timedelta(days=days_since_monday) + timedelta(weeks=self.view_offset)
+
+        # Dynamic column width calculation
+        time_col_width = 6  # "12 PM" etc
+        available_width = term_width - time_col_width - 2
+        day_col_width = max(10, available_width // 7)
+
+        # Calculate rows per hour based on available height
+        # Reserve: header+controls(5) + week header(3) + day headers(1) + separator(1) + allday(1) + separator(1)
+        num_hours = WEEK_HOUR_END - WEEK_HOUR_START
+        fixed_rows = 5 + 3 + 1 + 1 + 1 + 1
+        available_height = term_height - fixed_rows
+        rows_per_hour = max(1, available_height // num_hours)
+
+        # Week header
+        week_end = week_start + timedelta(days=6)
+        week_header = f"  WEEK OF {week_start.strftime('%b %d').upper()} - {week_end.strftime('%b %d, %Y').upper()}"
+        lines.append(("", 0))
+        lines.append((week_header, curses.color_pair(self.COLOR_DATE) | curses.A_BOLD))
+        lines.append(("", 0))
+
+        # Day column headers
+        header_line = " " * time_col_width + "│"
+        for day_offset in range(7):
+            day_date = week_start + timedelta(days=day_offset)
+            day_name = day_date.strftime("%a")
+            day_num = day_date.day
+            is_today = day_date == today
+
+            # Dynamic header based on column width
+            if day_col_width >= 15:
+                day_label = day_date.strftime("%a %b %d")
+            else:
+                day_label = f"{day_name} {day_num}"
+
+            if is_today:
+                cell = f"[{day_label:^{day_col_width-2}}]│"
+            else:
+                cell = f"{day_label:^{day_col_width}}│"
+            header_line += cell
+
+        lines.append((header_line, curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD))
+
+        # Separator under header
+        sep = "─" * time_col_width + "┼" + ("─" * day_col_width + "┼") * 6 + "─" * day_col_width + "┤"
+        lines.append((sep, curses.color_pair(self.COLOR_DIM)))
+
+        # All-day events row
+        allday_row = "ALLDY │"
+        for day_offset in range(7):
+            day_date = week_start + timedelta(days=day_offset)
+            date_key = day_date.strftime("%Y-%m-%d")
+            day_events = grouped.get(date_key, [])
+            allday_events = [e for e in day_events if e['is_all_day']]
+
+            if allday_events:
+                # Show first all-day event title (truncated to fit cell)
+                max_title = day_col_width - 2
+                title = allday_events[0]['summary'][:max_title]
+                if len(allday_events) > 1:
+                    more = f" +{len(allday_events) - 1}"
+                    if len(title) + len(more) <= max_title:
+                        title += more
+                    else:
+                        title = title[:max_title - len(more)] + more
+                cell = f" {title:<{day_col_width - 1}}│"
+            else:
+                cell = " " * day_col_width + "│"
+            allday_row += cell
+
+        lines.append((allday_row, curses.color_pair(self.COLOR_ALLDAY)))
+
+        # Separator after all-day
+        lines.append((sep, curses.color_pair(self.COLOR_DIM)))
+
+        # Build a map of events by hour for quick lookup
+        # For each day, track which hours have which events
+        event_grid = {}  # (day_offset, hour) -> list of events
+        for day_offset in range(7):
+            day_date = week_start + timedelta(days=day_offset)
+            date_key = day_date.strftime("%Y-%m-%d")
+            day_events = grouped.get(date_key, [])
+
+            for event in day_events:
+                if event['is_all_day']:
+                    continue
+
+                start_hour = event['start'].hour
+                end_hour = event['end'].hour
+                if event['end'].minute > 0:
+                    end_hour += 1  # Round up
+
+                for hour in range(start_hour, max(end_hour, start_hour + 1)):
+                    if WEEK_HOUR_START <= hour < WEEK_HOUR_END:
+                        key = (day_offset, hour)
+                        if key not in event_grid:
+                            event_grid[key] = []
+                        if event not in event_grid[key]:
+                            event_grid[key].append(event)
+
+        # Hourly rows
+        for hour in range(WEEK_HOUR_START, WEEK_HOUR_END):
+            # Time label
+            if TIME_FORMAT == "12":
+                if hour == 0:
+                    time_label = "12 AM"
+                elif hour < 12:
+                    time_label = f"{hour:2d} AM"
+                elif hour == 12:
+                    time_label = "12 PM"
+                else:
+                    time_label = f"{hour - 12:2d} PM"
+            else:
+                time_label = f"{hour:02d}:00"
+
+            # Render multiple rows per hour
+            for row_in_hour in range(rows_per_hour):
+                if row_in_hour == 0:
+                    hour_row = f"{time_label:>5} │"
+                else:
+                    hour_row = f"{'':>5} │"  # Empty time label for subsequent rows
+
+                for day_offset in range(7):
+                    key = (day_offset, hour)
+                    events_this_hour = event_grid.get(key, [])
+
+                    if events_this_hour:
+                        max_title = day_col_width - 2
+
+                        if row_in_hour < len(events_this_hour):
+                            # Show event at this row index
+                            event = events_this_hour[row_in_hour]
+                            if event['start'].hour == hour:
+                                title = event['summary'][:max_title]
+                                cell = f" {title:<{day_col_width - 1}}│"
+                            else:
+                                # Continuation
+                                cell = f" {self.get_symbol('continuation'):<{day_col_width - 1}}│"
+                        elif row_in_hour == 0 and events_this_hour:
+                            # First row, show first event
+                            event = events_this_hour[0]
+                            if event['start'].hour == hour:
+                                title = event['summary'][:max_title]
+                                if len(events_this_hour) > rows_per_hour:
+                                    more = f" +{len(events_this_hour) - rows_per_hour}"
+                                    if len(title) + len(more) <= max_title:
+                                        title += more
+                                cell = f" {title:<{day_col_width - 1}}│"
+                            else:
+                                cell = f" {self.get_symbol('continuation'):<{day_col_width - 1}}│"
+                        else:
+                            # Empty row within hour block
+                            cell = " " * day_col_width + "│"
+                    else:
+                        cell = " " * day_col_width + "│"
+
+                    hour_row += cell
+
+                lines.append((hour_row, curses.color_pair(self.COLOR_TIME)))
+
+        return lines
+
+    def render_header(self, height: int, width: int):
+        """Render the header section with controls below."""
+        now = now_local()
+
+        # View indicator
+        view_indicators = {'agenda': '[A]', 'month': '[M]', 'week': '[W]'}
+        view_ind = view_indicators.get(self.current_view, '[?]')
+
+        # Full width header
+        header_width = width - 4
+
         border_top = f"╔{'═' * header_width}╗"
         border_bot = f"╚{'═' * header_width}╝"
 
@@ -454,23 +821,58 @@ class CalendarUI:
         time_str = now.strftime("%I:%M:%S %p")
         weekday = now.strftime("%A").upper()
 
-        # Title line
-        title_line = f"║ {date_str}  {time_str}  {self.get_symbol('calendar')} {self.title:^30} ║"
-        title_line = title_line[:header_width + 2]
-        if len(title_line) < header_width + 2:
-            title_line = title_line[:-1] + ' ' * (header_width + 2 - len(title_line)) + '║'
+        # Three sections: left (date/time), center (title), right (view indicator)
+        left_content = f" {date_str}  {time_str}  {weekday}"
+        center_content = f"{self.get_symbol('calendar')} {self.title}"
+        right_content = f"{view_ind} "
+
+        # Calculate spacing for three sections
+        total_content = len(left_content) + len(center_content) + len(right_content)
+        total_padding = header_width - total_content
+
+        left_pad = total_padding // 2
+        right_pad = total_padding - left_pad
+
+        title_line = f"║{left_content}{' ' * left_pad}{center_content}{' ' * right_pad}{right_content}║"
+
+        # Build controls line
+        if self.current_view == 'month':
+            controls = "q:Quit  ←→:Months  a:Agenda  w:Week  r:Refresh"
+        elif self.current_view == 'week':
+            controls = "q:Quit  ←→:Weeks  a:Agenda  m:Month  r:Refresh"
+        else:
+            controls = "q:Quit  ↑↓:Scroll  a:Agenda  m:Month  w:Week  r:Refresh"
+
+        # Status info
+        if self.client.last_error:
+            status = f"ERROR: {self.client.last_error}"
+        else:
+            if self.client.last_fetch:
+                # Use configured timezone for consistency
+                tz = get_local_tz()
+                if tz:
+                    last_update = datetime.fromtimestamp(self.client.last_fetch, tz=tz).strftime("%H:%M:%S")
+                else:
+                    last_update = datetime.fromtimestamp(self.client.last_fetch).strftime("%H:%M:%S")
+            else:
+                last_update = "Never"
+            status = f"Updated: {last_update}"
+
+        # Controls line with status
+        controls_line = f"  {controls}    {status}"
 
         try:
-            self.stdscr.addstr(0, 1, border_top, curses.color_pair(self.COLOR_HEADER))
-            self.stdscr.addstr(1, 1, title_line, curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD)
-            self.stdscr.addstr(2, 1, border_bot, curses.color_pair(self.COLOR_HEADER))
+            self.stdscr.addstr(0, 1, border_top[:width-2], curses.color_pair(self.COLOR_HEADER))
+            self.stdscr.addstr(1, 1, title_line[:width-2], curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD)
+            self.stdscr.addstr(2, 1, border_bot[:width-2], curses.color_pair(self.COLOR_HEADER))
+            self.stdscr.addstr(3, 0, controls_line[:width-1], curses.color_pair(self.COLOR_EVENT))
         except curses.error:
             pass
 
     def render_content(self, height: int, width: int):
         """Render the scrollable content area."""
-        content_start = 4
-        content_height = height - content_start - 2  # Leave room for footer
+        content_start = 5  # After header (3 rows) + controls (1 row) + gap (1 row)
+        content_height = height - content_start - 1  # Use almost full height, no footer needed
 
         # Clamp scroll offset
         max_scroll = max(0, len(self.content_lines) - content_height)
@@ -488,35 +890,8 @@ class CalendarUI:
                 pass
 
     def render_footer(self, height: int, width: int):
-        """Render the footer with controls and status."""
-        # Scroll indicator
-        if self.content_lines:
-            total = len(self.content_lines)
-            visible = height - 6
-            pos = self.scroll_offset
-            pct = int((pos / max(1, total - visible)) * 100) if total > visible else 100
-            scroll_info = f"[{pct:3d}%]"
-        else:
-            scroll_info = "[---]"
-
-        # Status line
-        if self.client.last_error:
-            status = f"ERROR: {self.client.last_error}"
-            status_attr = curses.color_pair(self.COLOR_ERROR)
-        else:
-            last_update = datetime.fromtimestamp(self.client.last_fetch).strftime("%H:%M:%S") if self.client.last_fetch else "Never"
-            status = f"Last update: {last_update}"
-            status_attr = curses.color_pair(self.COLOR_DIM)
-
-        # Controls
-        controls = "q:Quit  ↑↓:Scroll  PgUp/Dn:Page  r:Refresh"
-
-        footer = f" {scroll_info} {status:<30} {controls}"
-
-        try:
-            self.stdscr.addstr(height - 1, 0, footer[:width - 1], curses.color_pair(self.COLOR_DIM))
-        except curses.error:
-            pass
+        """Footer is now rendered as part of header - this method is kept for compatibility."""
+        pass
 
     def render(self, events: list):
         """Full screen render."""
@@ -531,11 +906,28 @@ class CalendarUI:
             self.stdscr.refresh()
             return
 
+        # Check minimum widths for grid views and fall back to agenda if too small
+        effective_view = self.current_view
+        min_month_width = 62  # 7 cols * 8 chars + borders
+        min_week_width = 84   # 7 cols * 10 chars + time col + borders
+
+        if self.current_view == 'month' and width < min_month_width:
+            effective_view = 'agenda'
+        elif self.current_view == 'week' and width < min_week_width:
+            effective_view = 'agenda'
+
+        # Temporarily override view for rendering if terminal too small
+        original_view = self.current_view
+        self.current_view = effective_view
+
         self.content_lines = self.build_content(events)
 
         self.render_header(height, width)
         self.render_content(height, width)
         self.render_footer(height, width)
+
+        # Restore original view
+        self.current_view = original_view
 
         self.stdscr.refresh()
 
@@ -547,10 +939,36 @@ class CalendarUI:
             return True
 
         height, _ = self.stdscr.getmaxyx()
-        page_size = height - 6
+        page_size = height - 6  # Match content_height calculation (content_start=5, minus 1)
 
         if key == ord('q') or key == 27:  # q or ESC
             return False
+
+        # View switching
+        elif key == ord('m'):
+            self.current_view = 'month'
+            self.view_offset = 0
+            self.scroll_offset = 0
+        elif key == ord('w'):
+            self.current_view = 'week'
+            self.view_offset = 0
+            self.scroll_offset = 0
+        elif key == ord('a'):
+            self.current_view = 'agenda'
+            self.view_offset = 0
+            self.scroll_offset = 0
+
+        # Navigation - Left/Right for month/week views
+        elif key == curses.KEY_LEFT or key == ord('h'):
+            if self.current_view in ('month', 'week'):
+                self.view_offset -= 1
+                self.scroll_offset = 0
+        elif key == curses.KEY_RIGHT or key == ord('l'):
+            if self.current_view in ('month', 'week'):
+                self.view_offset += 1
+                self.scroll_offset = 0
+
+        # Scrolling - Up/Down
         elif key == curses.KEY_UP or key == ord('k'):
             self.scroll_offset = max(0, self.scroll_offset - 1)
         elif key == curses.KEY_DOWN or key == ord('j'):
@@ -561,6 +979,7 @@ class CalendarUI:
             self.scroll_offset += page_size
         elif key == curses.KEY_HOME:
             self.scroll_offset = 0
+            self.view_offset = 0  # Also reset to current month/week
         elif key == curses.KEY_END:
             self.scroll_offset = max(0, len(self.content_lines) - page_size)
         elif key == ord('r'):  # Force refresh
