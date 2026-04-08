@@ -36,15 +36,15 @@ An htop-like terminal UI for displaying your Home Assistant calendar agenda. Per
 
 ## Features
 
+- **Three views** - Agenda (scrolling list), Month (calendar grid), and Week (7-day hourly planner)
 - **Full-screen terminal UI** - Like htop, runs in your terminal with colors and scrolling
 - **Real-time updates** - Clock updates every second, calendar refreshes every minute
-- **7-day agenda view** - See today through the next week at a glance
 - **All-day event support** - Clearly marked with special formatting
 - **Location display** - Optional display of event locations
 - **Kiosk mode** - Auto-start on boot for dedicated displays
 - **Zero dependencies** - Uses only Python standard library (curses, urllib)
 - **Unicode & ASCII modes** - Works on any terminal
-- **Vim-style navigation** - Use `j`/`k` for scrolling
+- **Vim-style navigation** - `h`/`j`/`k`/`l` for navigation
 
 ## Use Cases
 
@@ -135,7 +135,7 @@ All configuration is done via environment variables in `.env`. The app auto-load
 |----------|---------|-------------|
 | `HA_CALENDAR_ENTITY` | `calendar.family` | Calendar entity ID to display |
 | `HA_CALENDAR_TITLE` | `FAMILY CALENDAR` | Custom title in header |
-| `HA_DAYS_AHEAD` | `7` | Number of days to show (1-30) |
+| `HA_DAYS_AHEAD` | `60` | Number of days of events to fetch |
 
 ### Display Options
 
@@ -145,6 +145,16 @@ All configuration is done via environment variables in `.env`. The app auto-load
 | `HA_TIME_FORMAT` | `12` | Time format: `12` or `24` |
 | `HA_SHOW_LOCATIONS` | `true` | Show event locations |
 | `HA_SHOW_DESCRIPTIONS` | `false` | Show event descriptions |
+| `HA_TIMEZONE` | (system) | IANA timezone name (e.g. `America/Edmonton`) |
+
+### View Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HA_DEFAULT_VIEW` | `agenda` | Starting view: `agenda`, `month`, or `week` |
+| `HA_WEEK_START` | `monday` | Week start day: `monday` or `sunday` |
+| `HA_WEEK_HOUR_START` | `7` | First hour shown in week view (24h) |
+| `HA_WEEK_HOUR_END` | `21` | Last hour shown in week view (24h) |
 
 ### Refresh Intervals
 
@@ -194,14 +204,19 @@ HA_USE_UNICODE=false
 
 | Key | Action |
 |-----|--------|
-| `q` / `ESC` | Quit |
+| `a` | Agenda view (scrolling list) |
+| `m` | Month view (calendar grid) |
+| `w` | Week view (hourly planner) |
+| `←` / `h` | Previous month/week (in month/week views) |
+| `→` / `l` | Next month/week (in month/week views) |
 | `↑` / `k` | Scroll up |
 | `↓` / `j` | Scroll down |
 | `PgUp` | Page up |
 | `PgDn` | Page down |
-| `Home` | Jump to top |
+| `Home` | Jump to top / reset to current period |
 | `End` | Jump to bottom |
 | `r` | Force refresh from API |
+| `q` / `ESC` | Quit |
 
 ## Kiosk Mode Setup
 

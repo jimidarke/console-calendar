@@ -4,71 +4,54 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Console Calendar is an htop-like terminal UI for displaying Home Assistant calendar agenda. It uses Python's built-in curses library for the TUI with zero external dependencies.
+Console Calendar is two related but independent components:
 
-## Running the Application
+1. **Console TUI** (`ha_calendar_console.py`) — A curses-based terminal UI that displays a Home Assistant calendar agenda. Zero external dependencies (stdlib only). Designed for kiosk/Raspberry Pi use.
 
+2. **cal-quickadd** (`cal-quickadd/`) — A FastAPI web service that parses natural language (and images) into Google Calendar events using Gemini AI. Separate dependency stack, runs in Docker.
+
+These share a repo but have no code dependencies on each other.
+
+## Commands
+
+### Console TUI
 ```bash
-# Run the calendar console
-./run_calendar.sh
-# or
-python3 ha_calendar_console.py
-
-# List available calendars from Home Assistant
-python3 ha_list_calendars.py
-
-# Test API connection and configuration
-python3 test_ha_calendar.py
+./run_calendar.sh                          # Launch via wrapper
+python3 ha_calendar_console.py             # Launch directly
+python3 ha_list_calendars.py               # List available HA calendars
+python3 test_ha_calendar.py                # Test API connectivity
+sudo ./setup_kiosk.sh check|install|uninstall  # Kiosk mode
 ```
 
-## Configuration
-
-All configuration is done via environment variables loaded from a `.env` file in the project root. Copy `.env.example` to `.env` and set values.
-
-Required variables:
-- `HOMEASSISTANT_URL` - Home Assistant server URL
-- `HOMEASSISTANT_LONG_LIVE_TOKEN` - Long-lived access token from HA
-
-Key optional variables:
-- `HA_CALENDAR_ENTITY` - Calendar entity ID (default: `calendar.family`)
-- `HA_CALENDAR_TITLE` - Header title
-- `HA_DAYS_AHEAD` - Days to display (1-30)
-- `HA_USE_UNICODE` - Unicode symbols vs ASCII fallback
-- `HA_TIME_FORMAT` - 12 or 24 hour format
-- `HA_DEFAULT_VIEW` - Starting view: `agenda`, `month`, or `week`
-- `HA_WEEK_HOUR_START` / `HA_WEEK_HOUR_END` - Hour range for week view
-
-## Views
-
-Three display modes available, switchable via keyboard:
-
-- **Agenda View** (`a`) - Default scrolling list of events by day
-- **Month View** (`m`) - Calendar grid with activity indicators (● timed, ○ all-day)
-- **Week View** (`w`) - 7-day planner with hourly time slots
-
-Navigation:
-- `a`/`m`/`w` - Switch views
-- `←`/`→` - Navigate months/weeks (in month/week views)
-- `↑`/`↓` - Scroll content
-- `Home` - Reset to current period
+### cal-quickadd
+```bash
+cd cal-quickadd
+pip install -r requirements.txt
+python setup_oauth.py                      # Initial Google OAuth setup
+uvicorn app.main:app --host 0.0.0.0 --port 8000  # Run server
+docker compose up                          # Or via Docker
+python test_parser.py                      # Test AI parsing
+python test_api.py                         # Test API endpoints
+```
 
 ## Architecture
 
-**Single-file TUI application** (`ha_calendar_console.py`):
-- `load_env_file()` - Loads `.env` from script directory at import time
-- `HACalendarClient` - HTTP client for Home Assistant calendar API using urllib (no requests dependency)
-- `parse_event_time()` / `group_events_by_date()` - Event parsing and date grouping
-- `CalendarUI` - Curses-based display with color pairs, scrolling, and keyboard handling
-  - `build_agenda_content()` - Vertical scrolling event list
-  - `build_month_content()` - Calendar grid with activity indicators
-  - `build_week_content()` - 7-column hourly planner
-- Main loop: polls API at configurable interval, redraws screen every second
+### Console TUI (`ha_calendar_console.py` — single file)
+- `HACalendarClient` — HA REST API client (`/api/calendars/{entity}`), Bearer token auth, cached with configurable refresh
+- `CalendarUI` — curses rendering with three views:
+  - `build_agenda_content()` — scrolling event list by day
+  - `build_month_content()` — calendar grid with event indicators
+  - `build_week_content()` — 7-column hourly planner
+- `parse_event_time()` / `group_events_by_date()` — event data processing
+- Config loaded from `.env` via `load_env_file()` at import time
+- Entry: `run()` → `curses.wrapper(main)`
 
-**Utility scripts**:
-- `ha_list_calendars.py` - Lists available HA calendar entities
-- `test_ha_calendar.py` - Validates API connectivity and fetches sample events
-- `setup_kiosk.sh` - Configures Linux auto-login and auto-start for kiosk displays
+### cal-quickadd
+- `app/main.py` — FastAPI app with `/add` (text→event) and `/scan` (image→events) endpoints, rate limiting middleware
+- `app/ai_parser.py` — Gemini 2.0 Flash for NLP parsing. Structured prompts with family member context and date awareness
+- `app/calendar_api.py` — Google Calendar API via OAuth2. Per-family-member calendar routing via `FAMILY_CALENDARS` env var
+- `app/config.py` — env var loading. Requires `GEMINI_API_KEY` and `GOOGLE_CALENDAR_ID`
 
-**Data flow**: HA API → `HACalendarClient.get_events()` → cached events → `group_events_by_date()` → `CalendarUI.build_content()` → curses rendering
+## Configuration
 
-The application avoids external dependencies by using only Python standard library (curses, urllib, json, datetime, zoneinfo).
+Both components use `.env` files (git-ignored). The console TUI reads `HOMEASSISTANT_URL`, `HOMEASSISTANT_LONG_LIVE_TOKEN`, and `HA_*` vars. cal-quickadd requires `GEMINI_API_KEY`, `GOOGLE_CALENDAR_ID`, and Google OAuth credentials at `/config/`.

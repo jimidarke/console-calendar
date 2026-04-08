@@ -24,3 +24,7 @@ Thumbs.db
 
 # Kiosk backups
 .kiosk-backup-*/
+
+# cal-quickadd secrets and runtime
+cal-quickadd/.env
+cal-quickadd/config/
