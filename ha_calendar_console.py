@@ -226,9 +226,13 @@ class HACalendarClient:
         endpoint = f"/api/calendars/{entity_id}?start={start_str}&end={end_str}"
         result = self._make_request(endpoint)
 
+        # Always advance last_fetch so failures back off to API_REFRESH_INTERVAL
+        # instead of tight-looping the outer run() loop every 50ms (a stale
+        # token was producing ~6 requests/sec against HA).
+        self.last_fetch = time.time()
+
         if result is not None:
             self.cached_events = result
-            self.last_fetch = time.time()
             self.last_error = None
 
         return self.cached_events
