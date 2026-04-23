@@ -19,17 +19,20 @@ Controls:
     PgUp/PgDn     - Scroll page
     Home/End      - Jump to top/bottom, reset to current period
     r             - Force refresh
+    F2            - Quick add event (requires CAL_QUICKADD_URL)
 
 Repository: https://github.com/jimidarke/console-calendar
 """
 
 import curses
-import os
-import sys
-import time
-import urllib.request
-import urllib.error
 import json
+import os
+import socket
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -88,6 +91,9 @@ DEFAULT_VIEW = os.environ.get("HA_DEFAULT_VIEW", "agenda")  # agenda, month, wee
 WEEK_START = os.environ.get("HA_WEEK_START", "monday").lower()  # monday or sunday
 WEEK_HOUR_START = int(os.environ.get("HA_WEEK_HOUR_START", "7"))
 WEEK_HOUR_END = int(os.environ.get("HA_WEEK_HOUR_END", "21"))
+
+# Quick Add Integration
+CAL_QUICKADD_URL = os.environ.get("CAL_QUICKADD_URL", "")
 
 
 def get_local_tz():
@@ -348,6 +354,13 @@ class CalendarUI:
         self.current_view = DEFAULT_VIEW  # 'agenda', 'month', 'week'
         self.view_offset = 0  # Offset for month/week navigation (0 = current)
         self.cached_events = []  # Store events for all views
+
+        # Quick add modal state
+        self.modal_state = None        # None | "input" | "sending" | "result"
+        self.input_buffer = ""
+        self.input_cursor = 0
+        self.quickadd_result = None
+        self.quickadd_thread = None
 
         self._init_colors()
         self._init_screen()
@@ -842,6 +855,8 @@ class CalendarUI:
             controls = "q:Quit  ←→:Weeks  a:Agenda  m:Month  r:Refresh"
         else:
             controls = "q:Quit  ↑↓:Scroll  a:Agenda  m:Month  w:Week  r:Refresh"
+        if CAL_QUICKADD_URL:
+            controls += "  F2:Add"
 
         # Status info
         if self.client.last_error:
@@ -893,6 +908,241 @@ class CalendarUI:
         """Footer is now rendered as part of header - this method is kept for compatibility."""
         pass
 
+    # ── Quick Add Modal ───────────────────────────────────────────────────
+
+    def _draw_modal_box(self, y: int, x: int, h: int, w: int, title: str, color: int):
+        """Draw a bordered box with a centered title."""
+        attr = curses.color_pair(color)
+        # Top border with title
+        if self.use_unicode:
+            top = "╔" + "═" * (w - 2) + "╗"
+            bot = "╚" + "═" * (w - 2) + "╝"
+            side = "║"
+        else:
+            top = "+" + "-" * (w - 2) + "+"
+            bot = "+" + "-" * (w - 2) + "+"
+            side = "|"
+        try:
+            self.stdscr.addstr(y, x, top[:w], attr)
+            # Insert title into top border
+            if title:
+                t = f" {title} "
+                tx = x + (w - len(t)) // 2
+                self.stdscr.addstr(y, tx, t, attr | curses.A_BOLD)
+            # Side borders and blank interior
+            for row in range(1, h - 1):
+                self.stdscr.addstr(y + row, x, side, attr)
+                self.stdscr.addstr(y + row, x + 1, " " * (w - 2), curses.color_pair(self.COLOR_EVENT))
+                self.stdscr.addstr(y + row, x + w - 1, side, attr)
+            self.stdscr.addstr(y + h - 1, x, bot[:w], attr)
+        except curses.error:
+            pass
+
+    def render_modal(self, height: int, width: int):
+        """Render the active modal overlay."""
+        if self.modal_state == "input":
+            self._render_input_modal(height, width)
+        elif self.modal_state == "sending":
+            self._render_sending_modal(height, width)
+            # Check if thread finished
+            if self.quickadd_thread and not self.quickadd_thread.is_alive():
+                self.modal_state = "result"
+                self.quickadd_thread = None
+        elif self.modal_state == "result":
+            self._render_result_modal(height, width)
+
+    def _render_input_modal(self, height: int, width: int):
+        """Draw the text input box at the bottom of the screen."""
+        box_w = min(width - 4, 70)
+        box_h = 3
+        box_x = (width - box_w) // 2
+        box_y = height - box_h - 1
+
+        self._draw_modal_box(box_y, box_x, box_h, box_w, "Quick Add Event", self.COLOR_ACCENT)
+
+        # Input line
+        prompt = "> "
+        max_text = box_w - 4 - len(prompt)
+        # Scroll input if longer than visible area
+        visible_start = max(0, self.input_cursor - max_text + 1)
+        visible_text = self.input_buffer[visible_start:visible_start + max_text]
+        cursor_x = self.input_cursor - visible_start
+
+        try:
+            self.stdscr.addstr(box_y + 1, box_x + 2, prompt, curses.color_pair(self.COLOR_ACCENT))
+            self.stdscr.addstr(box_y + 1, box_x + 2 + len(prompt), visible_text, curses.color_pair(self.COLOR_EVENT))
+            # Position cursor
+            curses.curs_set(1)
+            self.stdscr.move(box_y + 1, box_x + 2 + len(prompt) + cursor_x)
+        except curses.error:
+            pass
+
+        # Hint in bottom border
+        hint = " Enter:Send  ESC:Cancel "
+        try:
+            hx = box_x + (box_w - len(hint)) // 2
+            self.stdscr.addstr(box_y + box_h - 1, hx, hint, curses.color_pair(self.COLOR_ACCENT))
+        except curses.error:
+            pass
+
+    def _render_sending_modal(self, height: int, width: int):
+        """Draw sending indicator."""
+        box_w = min(width - 4, 70)
+        box_h = 3
+        box_x = (width - box_w) // 2
+        box_y = height - box_h - 1
+
+        self._draw_modal_box(box_y, box_x, box_h, box_w, "Quick Add Event", self.COLOR_ACCENT)
+
+        frames = ["|", "/", "-", "\\"]
+        spinner = frames[int(time.time() * 4) % len(frames)]
+        msg = f"Sending... {spinner}"
+        try:
+            curses.curs_set(0)
+            self.stdscr.addstr(box_y + 1, box_x + 2, msg, curses.color_pair(self.COLOR_TIME))
+        except curses.error:
+            pass
+
+    def _render_result_modal(self, height: int, width: int):
+        """Draw result overlay centered on screen."""
+        result = self.quickadd_result or {}
+        lines = []
+
+        if "error" in result:
+            title = "Error"
+            color = self.COLOR_ERROR
+            lines.append(result["error"])
+            lines.append("")
+            lines.append('Try: "dentist friday 2pm"')
+        elif result.get("status") == "created":
+            title = "Event Created"
+            color = self.COLOR_TIME
+            parsed = result.get("parsed") or {}
+            event = result.get("event") or {}
+            summary = parsed.get("title", event.get("title", ""))
+            date = parsed.get("date", "")
+            t = parsed.get("start_time", "")
+            person = parsed.get("person", "")
+            line = summary
+            if date:
+                line += f" on {date}"
+            if t:
+                line += f" at {t}"
+            check = get_symbol("bullet")
+            lines.append(f"{check} {line}")
+            if person:
+                lines.append(f"  Calendar: {person}")
+            msg = result.get("message", "")
+            if msg:
+                lines.append(f"  {msg}")
+        elif result.get("status") == "needs_confirmation":
+            title = "Low Confidence"
+            color = self.COLOR_DATE
+            parsed = result.get("parsed") or {}
+            summary = parsed.get("title", "?")
+            date = parsed.get("date", "?")
+            t = parsed.get("start_time", "")
+            line = f"? {summary} on {date}"
+            if t:
+                line += f" at {t}"
+            lines.append(line)
+            lines.append("(Not created - confidence too low)")
+        else:
+            title = "Could Not Parse"
+            color = self.COLOR_ERROR
+            lines.append(result.get("message", "Could not understand input"))
+            lines.append("")
+            lines.append('Try: "dentist friday 2pm"')
+
+        box_w = min(width - 4, 60)
+        # Truncate lines to fit
+        lines = [l[:box_w - 6] for l in lines]
+        box_h = len(lines) + 4  # borders + padding
+        box_x = (width - box_w) // 2
+        box_y = (height - box_h) // 2
+
+        self._draw_modal_box(box_y, box_x, box_h, box_w, title, color)
+
+        try:
+            curses.curs_set(0)
+            for i, line in enumerate(lines):
+                self.stdscr.addstr(box_y + 2 + i, box_x + 3, line, curses.color_pair(self.COLOR_EVENT))
+            # Hint
+            hint = " Press any key to close "
+            hx = box_x + (box_w - len(hint)) // 2
+            self.stdscr.addstr(box_y + box_h - 1, hx, hint, curses.color_pair(color))
+        except curses.error:
+            pass
+
+    def _handle_input_mode(self, key: int) -> bool:
+        """Handle keys during text input modal."""
+        if key == 27:  # ESC
+            self.modal_state = None
+            self.input_buffer = ""
+            self.input_cursor = 0
+            curses.curs_set(0)
+        elif key in (10, 13, curses.KEY_ENTER):  # Enter
+            if self.input_buffer.strip():
+                self.modal_state = "sending"
+                curses.curs_set(0)
+                t = threading.Thread(target=self._quickadd_send, args=(self.input_buffer,), daemon=True)
+                self.quickadd_thread = t
+                t.start()
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if self.input_cursor > 0:
+                self.input_buffer = self.input_buffer[:self.input_cursor - 1] + self.input_buffer[self.input_cursor:]
+                self.input_cursor -= 1
+        elif key == curses.KEY_DC:
+            if self.input_cursor < len(self.input_buffer):
+                self.input_buffer = self.input_buffer[:self.input_cursor] + self.input_buffer[self.input_cursor + 1:]
+        elif key == curses.KEY_LEFT:
+            self.input_cursor = max(0, self.input_cursor - 1)
+        elif key == curses.KEY_RIGHT:
+            self.input_cursor = min(len(self.input_buffer), self.input_cursor + 1)
+        elif key == curses.KEY_HOME:
+            self.input_cursor = 0
+        elif key == curses.KEY_END:
+            self.input_cursor = len(self.input_buffer)
+        elif 32 <= key <= 126:  # Printable ASCII
+            self.input_buffer = self.input_buffer[:self.input_cursor] + chr(key) + self.input_buffer[self.input_cursor:]
+            self.input_cursor += 1
+        return True
+
+    def _handle_result_mode(self, key: int) -> bool:
+        """Handle keys during result display - any key dismisses."""
+        if key != -1:
+            # Force calendar refresh if event was created
+            if self.quickadd_result and self.quickadd_result.get("status") == "created":
+                self.client.last_fetch = 0
+            self.modal_state = None
+            self.quickadd_result = None
+            self.input_buffer = ""
+            self.input_cursor = 0
+            curses.curs_set(0)
+        return True
+
+    def _quickadd_send(self, text: str):
+        """Send quick-add request to cal-quickadd service (runs in thread)."""
+        try:
+            url = f"{CAL_QUICKADD_URL.rstrip('/')}/add"
+            data = json.dumps({"text": text, "source": "console-tui"}).encode()
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                self.quickadd_result = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            try:
+                body = json.loads(e.read().decode())
+                self.quickadd_result = {"error": body.get("detail", f"HTTP {e.code}")}
+            except Exception:
+                self.quickadd_result = {"error": f"HTTP {e.code}"}
+        except urllib.error.URLError as e:
+            self.quickadd_result = {"error": f"Connection failed: {e.reason}"}
+        except socket.timeout:
+            self.quickadd_result = {"error": "Request timed out"}
+        except Exception as e:
+            self.quickadd_result = {"error": str(e)}
+        self.modal_state = "result"
+
     def render(self, events: list):
         """Full screen render."""
         self.stdscr.clear()
@@ -926,6 +1176,9 @@ class CalendarUI:
         self.render_content(height, width)
         self.render_footer(height, width)
 
+        if self.modal_state is not None:
+            self.render_modal(height, width)
+
         # Restore original view
         self.current_view = original_view
 
@@ -938,11 +1191,26 @@ class CalendarUI:
         except curses.error:
             return True
 
+        # Modal input delegation
+        if self.modal_state == "input":
+            return self._handle_input_mode(key)
+        if self.modal_state == "sending":
+            return True  # Ignore all keys while sending
+        if self.modal_state == "result":
+            return self._handle_result_mode(key)
+
         height, _ = self.stdscr.getmaxyx()
         page_size = height - 6  # Match content_height calculation (content_start=5, minus 1)
 
         if key == ord('q') or key == 27:  # q or ESC
             return False
+
+        # Quick add
+        elif key == curses.KEY_F2:
+            if CAL_QUICKADD_URL:
+                self.modal_state = "input"
+                self.input_buffer = ""
+                self.input_cursor = 0
 
         # View switching
         elif key == ord('m'):
