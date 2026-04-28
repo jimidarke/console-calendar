@@ -16,24 +16,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 
-def load_env_file():
-    """Load .env file from script directory if it exists."""
-    script_dir = Path(__file__).parent
-    env_file = script_dir / ".env"
-    if env_file.exists():
-        with open(env_file) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, _, value = line.partition('=')
-                    key = key.strip()
-                    value = value.strip()
-                    if key not in os.environ:
-                        os.environ[key] = value
+sys.path.insert(0, str(Path(__file__).parent))
+from cc_env import load_env  # noqa: E402
 
-
-# Load .env on import
-load_env_file()
+load_env(Path(__file__).parent)
 
 HA_URL = os.environ.get("HOMEASSISTANT_URL", "http://192.168.1.40:8123")
 HA_TOKEN = os.environ.get("HOMEASSISTANT_LONG_LIVE_TOKEN", "")

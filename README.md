@@ -3,6 +3,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
+This repo ships **two components** that work together but are deployed independently:
+
+1. **Console TUI** (`ha_calendar_console.py`) — a curses agenda display that reads from Home Assistant. Runs bare-metal on a TTY (kiosk autologin). Zero runtime dependencies (Python stdlib only).
+2. **cal-quickadd** (`cal-quickadd/`) — a FastAPI service that turns natural language ("jonnie soccer thursday 445pm") and images into Google Calendar events using Gemini. Runs in Docker.
+
+The TUI integrates with cal-quickadd via the `F2` key when `CAL_QUICKADD_URL` is set; both can run on the same host. See [`deploy/mserver/`](deploy/mserver/) for a single-host deploy.
+
+---
+
 An htop-like terminal UI for displaying your Home Assistant calendar agenda. Perfect for headless servers, kiosk displays, Raspberry Pi projects, or anyone who loves the terminal.
 
 ```
@@ -310,19 +319,117 @@ sudo reboot
 
 ```
 console-calendar/
-├── ha_calendar_console.py   # Main TUI application
-├── ha_list_calendars.py     # Utility: list available calendars
-├── test_ha_calendar.py      # Utility: test API connection
-├── run_calendar.sh          # Launcher script (sources .env)
-├── setup_kiosk.sh           # Kiosk mode installer
-├── .env.example             # Configuration template
-├── .env                     # Your configuration (git-ignored)
-├── .gitignore
-├── LICENSE                  # MIT License
-├── README.md
-└── systemd/
-    └── ha-calendar-console.service  # Alternative: systemd service
+├── ha_calendar_console.py        # TUI app (curses, stdlib only)
+├── ha_list_calendars.py          # Utility: list available HA calendars
+├── test_ha_calendar.py           # Utility: smoke-test HA API connectivity
+├── cc_env.py                     # Shared .env loader (used by TUI and cal-quickadd)
+├── run_calendar.sh               # Launcher script (sources .env)
+├── setup_kiosk.sh                # Kiosk autologin installer
+├── .env.example                  # TUI configuration template
+├── systemd/                      # Reference systemd unit (legacy)
+├── cal-quickadd/                 # FastAPI service (Gemini + Google Calendar)
+│   ├── app/                      # main.py, ai_parser.py, calendar_api.py, config.py
+│   ├── requirements.txt
+│   ├── setup_oauth.py            # One-time interactive Google OAuth helper
+│   ├── test_api.py               # FastAPI integration tests (some hit real Gemini)
+│   ├── test_parser_retry.py      # Unit tests for retry/backoff/fallback (all mocked)
+│   ├── Dockerfile, docker-compose.yml  # Legacy single-component deploy
+│   └── SECURITY.md
+├── deploy/
+│   ├── mserver/                  # TUI bare-metal kiosk (tty1, displayuser)
+│   │   ├── ha-calendar-console.service
+│   │   └── bootstrap.sh
+│   └── nserver/                  # cal-quickadd Docker host (port 8419)
+│       ├── Dockerfile, docker-compose.yml, .env.example
+│       └── bootstrap.sh
+├── CLAUDE.md, LICENSE, README.md, VERSION.txt
 ```
+
+## Production deploy
+
+Two hosts, one repo:
+
+- **mserver** runs the TUI bare-metal as user `displayuser` on `tty1` (autologin via `agetty`). Files live at `/home/displayuser/ha-calendar/`.
+- **nserver** runs `cal-quickadd` as a Docker container on port `8419`, fronted by an existing nginx-proxy + DNS record.
+
+The TUI talks to cal-quickadd over the network via `CAL_QUICKADD_URL`; the header shows a `[QA: ok | slow | auth! | quota | re-auth | down]` health pill that combines Gemini quota state and OAuth token age.
+
+### nserver (cal-quickadd)
+
+```bash
+# On nserver, with this repo synced/cloned to /root/docker/console-calendar:
+cd /root/docker/console-calendar
+cp deploy/nserver/.env.example deploy/nserver/.env   # fill in real values
+# Place Google OAuth credentials.json at deploy/nserver/config/credentials.json
+# Place a freshly-minted token.json beside it (or run /tmp/refresh_oauth.py
+# inside the running container after first start).
+deploy/nserver/bootstrap.sh
+```
+
+The script is idempotent — re-running rebuilds the image and restarts. While the OAuth consent screen is in **Testing** status, refresh tokens expire every 7 days; the TUI pill goes amber (`auth!`) ~24-33h before expiry and red (`re-auth`) when dead. To re-mint:
+
+```bash
+docker exec -it cal-quickadd python /tmp/refresh_oauth.py
+docker restart cal-quickadd
+```
+
+### mserver (TUI)
+
+```bash
+# On mserver, with this repo synced/cloned somewhere:
+INSTALL_TUI_SERVICE=yes deploy/mserver/bootstrap.sh
+```
+
+This copies `ha_calendar_console.py` and `cc_env.py` into `/home/displayuser/ha-calendar/`, preserving the existing `.env`. With `INSTALL_TUI_SERVICE=yes` it also drops the systemd unit and enables it (replacing the bash-profile respawn loop). Without that flag it just syncs the files; the running process picks them up next restart.
+
+## cal-quickadd
+
+A FastAPI service that converts natural language and images into Google Calendar events.
+
+### Endpoints
+
+| Method | Path     | Purpose |
+|--------|----------|---------|
+| POST   | `/add`   | `{"text": "jonnie soccer thursday 445pm"}` → creates event |
+| POST   | `/scan`  | multipart image upload (≤10 MB) → extracts and creates events |
+| GET    | `/health`| liveness + Gemini quota state |
+| GET    | `/`      | minimal web UI (`cal-quickadd/app/static/`) |
+
+### Key behaviour
+
+- **Retry/backoff on 429**: transient Gemini quota errors retry up to 3× with exponential backoff + jitter. On hard daily-quota exhaustion, falls back to `GEMINI_MODEL_FALLBACK` (default `gemini-1.5-flash`, separate quota bucket from `gemini-2.0-flash`). If both exhaust, the API returns **HTTP 429** with `Retry-After`.
+- **Family-member calendar routing**: `FAMILY_CALENDARS` env (JSON `{"jonnie": "calendar-id", ...}`) routes events per person; falls back to `GOOGLE_CALENDAR_ID`.
+- **Per-IP rate limit**: 30 POSTs / 60 s (FastAPI middleware).
+- **Optional shared-secret auth**: set `CAL_TOKEN`; clients must send `X-Cal-Token: <value>`.
+- **Health surface**: `/health` exposes `gemini_quota_state` (`ok|throttled|exhausted`) so the TUI can render a pill.
+
+### Required env
+
+| Variable | Purpose |
+|----------|---------|
+| `GEMINI_API_KEY` | Gemini Flash API key |
+| `GOOGLE_CALENDAR_ID` | Default calendar (usually your email) |
+| `GOOGLE_CREDENTIALS_PATH`, `GOOGLE_TOKEN_PATH` | OAuth artifacts (default `/config/...`) |
+| `GEMINI_MODEL_PRIMARY`, `GEMINI_MODEL_FALLBACK` | Model selection (defaults sane) |
+| `FAMILY_MEMBERS`, `FAMILY_CALENDARS` | Routing config |
+| `TIMEZONE` | IANA TZ for date resolution |
+| `CAL_TOKEN` | Optional shared secret |
+
+### Tests
+
+```bash
+cd cal-quickadd
+pip install -r requirements.txt pytest pytest-asyncio httpx
+GEMINI_API_KEY=test GOOGLE_CALENDAR_ID=test pytest test_parser_retry.py     # all mocked
+GEMINI_API_KEY=real GOOGLE_CALENDAR_ID=real pytest test_api.py              # hits Gemini
+```
+
+### Security notes (formerly SECURITY.md)
+
+- `/health` does NOT include event PII (this was fixed; was previously leaking the last-created event).
+- Bind to `127.0.0.1` in production unless `CAL_TOKEN` is set; the LAN-binding default in the legacy compose is **not safe** without auth.
+- 10 MB image cap on `/scan` is enforced by streaming + early bail-out, not after buffering.
+- OAuth token is stored at `GOOGLE_TOKEN_PATH` with default permissions; ensure the `config/` host-mount is mode 700.
 
 ## Troubleshooting
 

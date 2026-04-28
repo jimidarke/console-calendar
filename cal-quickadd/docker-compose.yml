@@ -1,3 +1,6 @@
+# DEPRECATED: prefer deploy/mserver/docker-compose.yml — that's the canonical
+# deploy that bundles cc_env.py and binds to 127.0.0.1. This file remains so the
+# legacy nserver instance keeps working until it's torn down.
 services:
   cal-quickadd:
     build: .

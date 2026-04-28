@@ -1,57 +1,37 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code working in this repository. See `README.md` for user-facing docs (setup, env vars, controls, deploy).
 
-## Project Overview
+## Repo shape
 
-Console Calendar is two related but independent components:
+Two components, one repo:
 
-1. **Console TUI** (`ha_calendar_console.py`) — A curses-based terminal UI that displays a Home Assistant calendar agenda. Zero external dependencies (stdlib only). Designed for kiosk/Raspberry Pi use.
+- **Console TUI** — `ha_calendar_console.py` plus helpers (`ha_list_calendars.py`, `test_ha_calendar.py`). Single-file curses app, **stdlib-only**. Loads config from `.env` via the shared `cc_env.load_env`.
+- **cal-quickadd** — `cal-quickadd/app/` (FastAPI + Gemini + Google Calendar). Has its own `requirements.txt` and Docker build.
 
-2. **cal-quickadd** (`cal-quickadd/`) — A FastAPI web service that parses natural language (and images) into Google Calendar events using Gemini AI. Separate dependency stack, runs in Docker.
+They are functionally independent (no Python imports between them). The integration point is HTTP: TUI calls `CAL_QUICKADD_URL/add` on `F2` and polls `CAL_QUICKADD_URL/health` for the status pill.
 
-These share a repo but have no code dependencies on each other.
+## Key files
 
-## Commands
+- `cc_env.py` — shared `.env` loader. Used by all four scripts that need env loading. Stdlib-only so the TUI keeps zero deps. **Do not** reintroduce `python-dotenv` for that reason.
+- `ha_calendar_console.py:189-` — `HACalendarClient._make_request`. 401/403/404 produce specific user-facing error messages; the back-off logic in `get_events` (always advance `last_fetch`) prevents tight-loop hammering of HA when fetches fail. Keep both behaviours intact.
+- `cal-quickadd/app/ai_parser.py` — `_call_gemini` is the one place Gemini is called. It handles retry/backoff/fallback and raises `QuotaExceeded` when both models are exhausted. Don't add direct `model.generate_content` calls elsewhere.
+- `cal-quickadd/app/main.py` — `/add` and `/scan` translate `QuotaExceeded` to **HTTP 429 + Retry-After** (not 422). `/health` must NOT include `last_event` PII.
+- `deploy/mserver/` — TUI bare-metal kiosk (systemd unit + sync bootstrap). `deploy/nserver/` — cal-quickadd Docker (build context = repo root so `cc_env.py` is bundled). The legacy `cal-quickadd/Dockerfile` and `cal-quickadd/docker-compose.yml` are still present but unused; remove them once you're confident no external script depends on them.
 
-### Console TUI
-```bash
-./run_calendar.sh                          # Launch via wrapper
-python3 ha_calendar_console.py             # Launch directly
-python3 ha_list_calendars.py               # List available HA calendars
-python3 test_ha_calendar.py                # Test API connectivity
-sudo ./setup_kiosk.sh check|install|uninstall  # Kiosk mode
-```
+## Production topology
 
-### cal-quickadd
-```bash
-cd cal-quickadd
-pip install -r requirements.txt
-python setup_oauth.py                      # Initial Google OAuth setup
-uvicorn app.main:app --host 0.0.0.0 --port 8000  # Run server
-docker compose up                          # Or via Docker
-python test_parser.py                      # Test AI parsing
-python test_api.py                         # Test API endpoints
-```
+- **mserver** runs the TUI bare-metal on tty1 as `displayuser` (autologin via `agetty`). Files at `/home/displayuser/ha-calendar/`. The TUI is **not** in a container — it needs the TTY for curses kiosk display.
+- **nserver** runs `cal-quickadd` as a Docker container on port 8419, fronted by an existing nginx-proxy + DNS. Files at `/root/docker/console-calendar/` (or wherever you sync the repo). The OAuth consent app is in Testing mode, so refresh tokens expire every 7 days — the `/health` `oauth.state` field and the TUI pill surface this proactively.
 
-## Architecture
+## Testing
 
-### Console TUI (`ha_calendar_console.py` — single file)
-- `HACalendarClient` — HA REST API client (`/api/calendars/{entity}`), Bearer token auth, cached with configurable refresh
-- `CalendarUI` — curses rendering with three views:
-  - `build_agenda_content()` — scrolling event list by day
-  - `build_month_content()` — calendar grid with event indicators
-  - `build_week_content()` — 7-column hourly planner
-- `parse_event_time()` / `group_events_by_date()` — event data processing
-- Config loaded from `.env` via `load_env_file()` at import time
-- Entry: `run()` → `curses.wrapper(main)`
+- `cal-quickadd/test_parser_retry.py` — unit tests for retry/backoff/fallback. All Gemini calls mocked. Run with any dummy `GEMINI_API_KEY=test`.
+- `cal-quickadd/test_api.py` — FastAPI integration tests. Some hit real Gemini; the quota-propagation and health tests mock the parser.
+- TUI has no automated tests beyond `test_ha_calendar.py` (HA connectivity smoke test).
 
-### cal-quickadd
-- `app/main.py` — FastAPI app with `/add` (text→event) and `/scan` (image→events) endpoints, rate limiting middleware
-- `app/ai_parser.py` — Gemini 2.0 Flash for NLP parsing. Structured prompts with family member context and date awareness
-- `app/calendar_api.py` — Google Calendar API via OAuth2. Per-family-member calendar routing via `FAMILY_CALENDARS` env var
-- `app/config.py` — env var loading. Requires `GEMINI_API_KEY` and `GOOGLE_CALENDAR_ID`
+## Conventions
 
-## Configuration
-
-Both components use `.env` files (git-ignored). The console TUI reads `HOMEASSISTANT_URL`, `HOMEASSISTANT_LONG_LIVE_TOKEN`, and `HA_*` vars. cal-quickadd requires `GEMINI_API_KEY`, `GOOGLE_CALENDAR_ID`, and Google OAuth credentials at `/config/`.
+- Single source of version info: `VERSION.txt` for now (TODO: migrate to `pyproject.toml` if a packaging story is added).
+- Don't import between the two components. If shared logic emerges beyond `cc_env.py`, add another small stdlib-only module at the repo root.
+- TUI code paths must remain stdlib-only.

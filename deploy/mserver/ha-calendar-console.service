@@ -1,0 +1,40 @@
+# systemd unit for the bare-metal TUI on mserver tty1.
+#
+# Install:
+#   sudo cp deploy/mserver/ha-calendar-console.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ha-calendar-console
+#
+# Assumes:
+#   - User 'displayuser' exists with autologin on tty1 (agetty --autologin displayuser)
+#   - Repo checked out at /home/displayuser/ha-calendar/
+#   - TUI files (ha_calendar_console.py, cc_env.py, .env) at /home/displayuser/ha-calendar/
+
+[Unit]
+Description=Home Assistant Calendar Console (kiosk on tty1)
+After=network-online.target
+Wants=network-online.target
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+User=displayuser
+WorkingDirectory=/home/displayuser/ha-calendar
+Environment=TERM=linux
+Environment=PYTHONUNBUFFERED=1
+
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+
+ExecStart=/usr/bin/python3 /home/displayuser/ha-calendar/ha_calendar_console.py
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
