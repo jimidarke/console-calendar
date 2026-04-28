@@ -47,24 +47,11 @@ except ImportError:
 # Configuration (loaded from environment variables)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_env_file():
-    """Load .env file from script directory if it exists."""
-    script_dir = Path(__file__).parent
-    env_file = script_dir / ".env"
-    if env_file.exists():
-        with open(env_file) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, _, value = line.partition('=')
-                    key = key.strip()
-                    value = value.strip()
-                    # Don't override existing env vars
-                    if key not in os.environ:
-                        os.environ[key] = value
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).parent))
+from cc_env import load_env  # noqa: E402
 
-# Load .env on import
-load_env_file()
+load_env(Path(__file__).parent)
 
 # Home Assistant Connection
 HA_URL = os.environ.get("HOMEASSISTANT_URL", "http://192.168.1.40:8123")
@@ -197,7 +184,14 @@ class HACalendarClient:
             with urllib.request.urlopen(req, timeout=10) as response:
                 return json.loads(response.read().decode())
         except urllib.error.HTTPError as e:
-            self.last_error = f"HTTP {e.code}: {e.reason}"
+            if e.code == 401:
+                self.last_error = "HA token rejected (401) — regenerate HOMEASSISTANT_LONG_LIVE_TOKEN"
+            elif e.code == 403:
+                self.last_error = "HA token forbidden (403) — check token scope/calendar permissions"
+            elif e.code == 404:
+                self.last_error = f"HA calendar entity not found (404): {endpoint}"
+            else:
+                self.last_error = f"HTTP {e.code}: {e.reason}"
             return None
         except urllib.error.URLError as e:
             self.last_error = f"Connection error: {e.reason}"
@@ -365,6 +359,11 @@ class CalendarUI:
         self.input_cursor = 0
         self.quickadd_result = None
         self.quickadd_thread = None
+
+        # Quick-add health pill: cached state from /health, refreshed in background.
+        self.quickadd_health = None  # None=unknown, "ok", "throttled", "exhausted", "down"
+        self._quickadd_health_last = 0.0
+        self._quickadd_health_thread = None
 
         self._init_colors()
         self._init_screen()
@@ -821,6 +820,7 @@ class CalendarUI:
 
     def render_header(self, height: int, width: int):
         """Render the header section with controls below."""
+        self._maybe_refresh_quickadd_health()
         now = now_local()
 
         # View indicator
@@ -876,6 +876,19 @@ class CalendarUI:
             else:
                 last_update = "Never"
             status = f"Updated: {last_update}"
+
+        # Quick-add health pill
+        if CAL_QUICKADD_URL and self.quickadd_health:
+            pill_map = {
+                "ok": "QA:ok",
+                "throttled": "QA:slow",
+                "warning": "QA:auth!",       # OAuth nearing 7-day expiry
+                "exhausted": "QA:quota",
+                "expired": "QA:re-auth",     # OAuth refresh dead
+                "down": "QA:down",
+            }
+            pill = pill_map.get(self.quickadd_health, "QA:?")
+            status = f"{status}  [{pill}]"
 
         # Controls line with status
         controls_line = f"  {controls}    {status}"
@@ -1146,6 +1159,51 @@ class CalendarUI:
         except Exception as e:
             self.quickadd_result = {"error": str(e)}
         self.modal_state = "result"
+
+    def _quickadd_health_poll(self):
+        """Refresh quickadd_health from /health (runs in thread).
+
+        Combines Gemini quota and OAuth token state into a single severity:
+          - "down"      : service unreachable
+          - "expired"   : OAuth refresh token dead — `/add` will 502
+          - "exhausted" : Gemini daily quota gone
+          - "warning"   : OAuth token >=80% of TTL — re-mint soon
+          - "throttled" : Gemini under transient pressure
+          - "ok"        : everything green
+        """
+        try:
+            url = f"{CAL_QUICKADD_URL.rstrip('/')}/health"
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                gemini = data.get("gemini_quota_state", "ok")
+                oauth = (data.get("oauth") or {}).get("state", "ok")
+                # Severity order — most-broken wins.
+                if oauth in ("expired", "missing"):
+                    self.quickadd_health = "expired"
+                elif gemini == "exhausted":
+                    self.quickadd_health = "exhausted"
+                elif oauth == "warning":
+                    self.quickadd_health = "warning"
+                elif gemini == "throttled":
+                    self.quickadd_health = "throttled"
+                else:
+                    self.quickadd_health = "ok"
+        except Exception:
+            self.quickadd_health = "down"
+
+    def _maybe_refresh_quickadd_health(self):
+        """Kick off a non-blocking health check at most every 30s."""
+        if not CAL_QUICKADD_URL:
+            return
+        now = time.time()
+        if now - self._quickadd_health_last < 30:
+            return
+        if self._quickadd_health_thread and self._quickadd_health_thread.is_alive():
+            return
+        self._quickadd_health_last = now
+        t = threading.Thread(target=self._quickadd_health_poll, daemon=True)
+        self._quickadd_health_thread = t
+        t.start()
 
     def render(self, events: list):
         """Full screen render."""

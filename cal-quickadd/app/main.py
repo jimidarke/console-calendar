@@ -1,16 +1,16 @@
 import logging
 import time
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import ai_parser, calendar_api, config
+from .ai_parser import QuotaExceeded
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -18,15 +18,18 @@ log = logging.getLogger(__name__)
 app = FastAPI(title="cal-quickadd", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Track last event for health endpoint
-_last_event: dict | None = None
-
 # Rate limiting: track request timestamps per IP
 _rate_limit: dict[str, list[float]] = defaultdict(list)
 RATE_LIMIT_MAX = 30
 RATE_LIMIT_WINDOW = 60  # seconds
 
 STATIC_DIR = Path(__file__).parent / "static"
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+def _check_token(x_cal_token: str | None) -> None:
+    if config.CAL_TOKEN and x_cal_token != config.CAL_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Cal-Token")
 
 
 # --- Middleware: IP logging + rate limiting ---
@@ -45,8 +48,11 @@ async def log_and_rate_limit(request: Request, call_next):
         _rate_limit[client_ip] = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
         if len(_rate_limit[client_ip]) >= RATE_LIMIT_MAX:
             log.warning("Rate limit hit: ip=%s", client_ip)
-            from fastapi.responses import JSONResponse
-            return JSONResponse(status_code=429, content={"detail": "Too many requests. Try again in a minute."})
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many requests. Try again in a minute."},
+                headers={"Retry-After": str(RATE_LIMIT_WINDOW)},
+            )
         _rate_limit[client_ip].append(now)
 
     return await call_next(request)
@@ -74,14 +80,21 @@ async def index():
 
 
 @app.post("/add", response_model=AddResponse)
-async def add_event(req: AddRequest):
-    global _last_event
+async def add_event(req: AddRequest, x_cal_token: str | None = Header(default=None)):
+    _check_token(x_cal_token)
 
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
 
     try:
         parsed = await ai_parser.parse(req.text)
+    except QuotaExceeded as e:
+        log.error("Quota exhausted: %s", e)
+        raise HTTPException(
+            status_code=429,
+            detail="AI quota exhausted. Please try again later.",
+            headers={"Retry-After": str(e.retry_after)},
+        )
     except Exception as e:
         log.error("Parse failed: %s", e)
         raise HTTPException(status_code=422, detail=f"Could not parse input: {e}")
@@ -114,8 +127,6 @@ async def add_event(req: AddRequest):
         log.error("Calendar API failed: %s", e)
         raise HTTPException(status_code=502, detail=f"Failed to create calendar event: {e}")
 
-    _last_event = {"event": event, "source": req.source, "created_at": datetime.now().isoformat()}
-
     time_str = parsed["start_time"] if parsed.get("start_time") else "all day"
     person_str = f" ({parsed['person']})" if parsed.get("person") else ""
     message = f"Added: {parsed['title']} on {parsed['date']} at {time_str}{person_str}"
@@ -126,18 +137,37 @@ async def add_event(req: AddRequest):
 
 
 @app.post("/scan")
-async def scan_image(file: UploadFile = File(...)):
-    global _last_event
+async def scan_image(
+    file: UploadFile = File(...),
+    x_cal_token: str | None = Header(default=None),
+):
+    _check_token(x_cal_token)
 
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Upload must be an image (JPEG, PNG, etc.)")
 
-    image_bytes = await file.read()
-    if len(image_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Image too large (max 10 MB)")
+    # Stream-read with a hard cap so we don't buffer >10 MB into memory before checking.
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(64 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail="Image too large (max 10 MB)")
+        chunks.append(chunk)
+    image_bytes = b"".join(chunks)
 
     try:
         events = await ai_parser.parse_image(image_bytes, file.content_type)
+    except QuotaExceeded as e:
+        log.error("Quota exhausted on /scan: %s", e)
+        raise HTTPException(
+            status_code=429,
+            detail="AI quota exhausted. Please try again later.",
+            headers={"Retry-After": str(e.retry_after)},
+        )
     except Exception as e:
         log.error("Image parse failed: %s", e)
         raise HTTPException(status_code=422, detail=f"Could not extract events from image: {e}")
@@ -160,7 +190,6 @@ async def scan_image(file: UploadFile = File(...)):
                     person=ev.get("person"),
                 )
                 created.append({**ev, "calendar_event": cal_event})
-                _last_event = {"event": cal_event, "source": "scan", "created_at": datetime.now().isoformat()}
             except Exception as e:
                 log.error("Calendar create failed for scanned event: %s", e)
                 ev["error"] = str(e)
@@ -188,7 +217,9 @@ async def health():
         "status": "ok",
         "timezone": config.TIMEZONE,
         "family_members": config.FAMILY_MEMBERS,
-        "last_event": _last_event,
+        "gemini_quota_state": ai_parser.quota_state,
+        "gemini_last_error": ai_parser.last_error,
+        "oauth": calendar_api.get_oauth_status(),
     }
 
 

@@ -1,6 +1,8 @@
+import asyncio
 import base64
 import json
 import logging
+import random
 from datetime import date
 
 import google.generativeai as genai
@@ -10,6 +12,20 @@ from . import config
 log = logging.getLogger(__name__)
 
 genai.configure(api_key=config.GEMINI_API_KEY)
+
+
+class QuotaExceeded(Exception):
+    """Gemini daily/per-minute quota exhausted; both primary and fallback models unavailable."""
+
+    def __init__(self, message: str, retry_after: int = 60):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+# Tracks the last quota state seen by the parser so /health can surface it.
+quota_state: str = "ok"  # "ok" | "throttled" | "exhausted"
+last_error: str | None = None
+
 
 SYSTEM_PROMPT = """\
 You are a calendar event parser. Extract structured event data from casual, messy human input.
@@ -83,22 +99,83 @@ def build_image_prompt(today: date) -> str:
     )
 
 
+def _is_quota_error(exc: BaseException) -> bool:
+    """Heuristic: google-generativeai raises ResourceExhausted or includes '429' in str."""
+    name = type(exc).__name__
+    if name in ("ResourceExhausted", "TooManyRequests"):
+        return True
+    s = str(exc)
+    return "429" in s or "Resource exhausted" in s or "quota" in s.lower()
+
+
+async def _call_gemini(*, system: str | None, parts, model_override: str | None = None) -> str:
+    """Call Gemini with retry on transient 429s and fallback to a secondary model on hard quota.
+
+    parts: either a string (text prompt) or a list of content parts for multimodal calls.
+    Returns response.text.
+    """
+    global quota_state, last_error
+
+    primary = model_override or config.GEMINI_MODEL_PRIMARY
+    fallback = config.GEMINI_MODEL_FALLBACK if not model_override else None
+    gen_cfg = genai.GenerationConfig(temperature=0, response_mime_type="application/json")
+
+    async def attempt(model_name: str) -> str:
+        model = genai.GenerativeModel(model_name, system_instruction=system) if system else genai.GenerativeModel(model_name)
+        # google-generativeai is sync; run in a worker thread so we don't block the event loop.
+        return await asyncio.to_thread(
+            lambda: model.generate_content(
+                parts,
+                generation_config=gen_cfg,
+                request_options={"timeout": 30},
+            ).text
+        )
+
+    delay = 2.0
+    last_exc: Exception | None = None
+    for i in range(3):
+        try:
+            text = await attempt(primary)
+            if quota_state != "ok":
+                log.info("Gemini quota recovered (model=%s)", primary)
+            quota_state = "ok"
+            last_error = None
+            return text
+        except Exception as e:
+            last_exc = e
+            if not _is_quota_error(e):
+                raise
+            log.warning("Gemini 429 on %s (attempt %d/3): %s", primary, i + 1, e)
+            quota_state = "throttled"
+            last_error = str(e)[:200]
+            if i < 2:
+                await asyncio.sleep(delay + random.uniform(0, 1))
+                delay *= 2
+
+    # Primary exhausted — try fallback once.
+    if fallback and fallback != primary:
+        log.warning("Primary model %s exhausted, falling back to %s", primary, fallback)
+        try:
+            text = await attempt(fallback)
+            quota_state = "throttled"  # primary still down
+            last_error = f"primary {primary} exhausted, using fallback {fallback}"
+            return text
+        except Exception as e:
+            last_exc = e
+            if not _is_quota_error(e):
+                raise
+            log.error("Fallback model %s also exhausted: %s", fallback, e)
+
+    quota_state = "exhausted"
+    last_error = str(last_exc)[:200] if last_exc else "quota exhausted"
+    raise QuotaExceeded(f"Gemini quota exhausted: {last_exc}", retry_after=60)
+
+
 async def parse(text: str) -> dict:
     today = date.today()
     system = build_prompt(today)
 
-    model = genai.GenerativeModel("gemini-2.0-flash", system_instruction=system)
-
-    response = model.generate_content(
-        text,
-        generation_config=genai.GenerationConfig(
-            temperature=0,
-            response_mime_type="application/json",
-        ),
-        request_options={"timeout": 30},
-    )
-
-    raw = response.text.strip()
+    raw = (await _call_gemini(system=system, parts=text)).strip()
     log.info("Gemini response: %s", raw)
 
     try:
@@ -119,23 +196,10 @@ async def parse_image(image_bytes: bytes, mime_type: str) -> list[dict]:
     today = date.today()
     prompt = build_image_prompt(today)
 
-    model = genai.GenerativeModel("gemini-2.0-flash")
-
     b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+    parts = [{"mime_type": mime_type, "data": b64}, prompt]
 
-    response = model.generate_content(
-        [
-            {"mime_type": mime_type, "data": b64},
-            prompt,
-        ],
-        generation_config=genai.GenerationConfig(
-            temperature=0,
-            response_mime_type="application/json",
-        ),
-        request_options={"timeout": 30},
-    )
-
-    raw = response.text.strip()
+    raw = (await _call_gemini(system=None, parts=parts)).strip()
     log.info("Gemini image response: %s", raw)
 
     try:
@@ -144,7 +208,6 @@ async def parse_image(image_bytes: bytes, mime_type: str) -> list[dict]:
         log.error("Gemini returned invalid JSON for image: %s", raw[:500])
         raise ValueError("AI returned unparseable response for image")
 
-    # Ensure it's a list
     if isinstance(parsed, dict):
         parsed = [parsed]
 

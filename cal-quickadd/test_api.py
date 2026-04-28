@@ -201,3 +201,30 @@ async def test_parse_no_person(client, mock_calendar):
     data = resp.json()
     if data["parsed"]:
         assert data["parsed"]["person"] is None
+
+
+# --- Quota / 429 propagation (parser mocked, no Gemini calls) ---
+
+@pytest.mark.asyncio
+async def test_add_quota_exceeded_returns_429(client):
+    from app.ai_parser import QuotaExceeded
+
+    async def boom(text):
+        raise QuotaExceeded("daily quota exhausted", retry_after=42)
+
+    with patch("app.main.ai_parser.parse", side_effect=boom):
+        resp = await client.post("/add", json={"text": "anything"})
+
+    assert resp.status_code == 429
+    assert resp.headers.get("Retry-After") == "42"
+
+
+@pytest.mark.asyncio
+async def test_health_includes_quota_state(client):
+    resp = await client.get("/health")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "gemini_quota_state" in data
+    assert data["gemini_quota_state"] in ("ok", "throttled", "exhausted")
+    # Health should NOT leak last_event PII
+    assert "last_event" not in data
